@@ -297,7 +297,7 @@ async def save(client: Client, message: Message):
             if is_private:
                 chatid = int("-100" + datas[4])
                 try:
-                    await handle_private(client, acc, message, chatid, msgid)
+                    success = await handle_private(client, acc, message, chatid, msgid)
                 except Exception as e:
                     logger.error(f"Error handling private chat: {e}")
                     if ERROR_MESSAGE:
@@ -306,7 +306,7 @@ async def save(client: Client, message: Message):
             elif is_batch:
                 username = datas[4]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    success = await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
                     logger.error(f"Error handling batch channel: {e}")
                     if ERROR_MESSAGE:
@@ -316,7 +316,7 @@ async def save(client: Client, message: Message):
                 # Restricted Public Channel
                 username = datas[3]
                 try:
-                    await handle_private(client, acc, message, username, msgid)
+                    success = await handle_private(client, acc, message, username, msgid)
                 except Exception as e:
                     logger.error(f"Error copy/handle private: {e}")
                     if ERROR_MESSAGE:
@@ -334,299 +334,387 @@ async def save(client: Client, message: Message):
         batch_temp.IS_BATCH[message.from_user.id] = True
 
 # -------------------
-# Handle private content
+# Handle private content with retry mechanism
 # -------------------
 
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
-    try:
-        msg: Message = await acc.get_messages(chatid, msgid)
-    except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
-        batch_temp.IS_BATCH[message.from_user.id] = True
-        await db.set_session(message.from_user.id, None)
-        await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
-        return
-    except Exception as e:
-        # Handle PeerIdInvalid (which might come as generic Exception or RPCError)
-        # We try to refresh dialogs to learn about the peer.
-        logger.warning(f"Error fetching message: {e}. Refreshing dialogs...")
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
         try:
-            async for dialog in acc.get_dialogs(limit=None):
-                if dialog.chat.id == chatid:
-                    break
             msg: Message = await acc.get_messages(chatid, msgid)
         except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
             batch_temp.IS_BATCH[message.from_user.id] = True
             await db.set_session(message.from_user.id, None)
             await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
-            return
-        except Exception as e2:
-            logger.error(f"Retry failed: {e2}")
-            return
-
-    if msg.empty:
-        return
-
-    msg_type = get_message_type(msg)
-    if not msg_type:
-        return
-
-    chat = message.chat.id
-    if batch_temp.IS_BATCH.get(message.from_user.id):
-        return
-
-    if "Text" == msg_type:
-        try:
-            await client.send_message(chat, f"**__{msg.text}__**", entities=msg.entities, reply_to_message_id=message.id,
-                                      parse_mode=enums.ParseMode.HTML)
-            return
+            return False
         except Exception as e:
-            logger.error(f"Error sending text message: {e}")
-            if ERROR_MESSAGE:
-                await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+            # Handle PeerIdInvalid (which might come as generic Exception or RPCError)
+            # We try to refresh dialogs to learn about the peer.
+            logger.warning(f"Error fetching message: {e}. Refreshing dialogs...")
+            try:
+                async for dialog in acc.get_dialogs(limit=None):
+                    if dialog.chat.id == chatid:
+                        break
+                msg: Message = await acc.get_messages(chatid, msgid)
+            except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
+                batch_temp.IS_BATCH[message.from_user.id] = True
+                await db.set_session(message.from_user.id, None)
+                await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
+                return False
+            except Exception as e2:
+                logger.error(f"Retry failed: {e2}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
+
+        if msg.empty:
+            retry_count += 1
+            if retry_count < max_retries:
+                await asyncio.sleep(5)
+                continue
+            else:
+                return False
+
+        msg_type = get_message_type(msg)
+        if not msg_type:
+            retry_count += 1
+            if retry_count < max_retries:
+                await asyncio.sleep(5)
+                continue
+            else:
+                return False
+
+        chat = message.chat.id
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+            return False
+
+        if "Text" == msg_type:
+            try:
+                await client.send_message(chat, f"**__{msg.text}__**", entities=msg.entities, reply_to_message_id=message.id,
                                           parse_mode=enums.ParseMode.HTML)
-            return
+                return True
+            except Exception as e:
+                logger.error(f"Error sending text message: {e}")
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
 
-    smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
-    
-    # ----------------------------------------
-    # Create unique temp directory for this task
-    # ----------------------------------------
-    temp_dir = f"downloads/{message.id}"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
-
-    try:
-        asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
-    except Exception as e:
-        logger.error(f"Error creating download status task: {e}")
+        smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
         
-    try:
-        # Download with a simpler file name to avoid path issues
-        # Instead of letting Pyrogram use the original filename, we'll download with a simple name
-        # and handle the original filename during upload
-        timestamp = int(time.time())
-        temp_file_name = f"file_{timestamp}"
-        file_path = await acc.download_media(
-            msg, 
-            file_name=os.path.join(temp_dir, temp_file_name), 
-            progress=progress, 
-            progress_args=[message, "down"]
-        )
-        
-        if os.path.exists(f'{message.id}downstatus.txt'):
-            os.remove(f'{message.id}downstatus.txt')
-            
-    except Exception as e:
-        # Check if cancelled (flag is True) or exception message contains "Cancelled"
-        if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
-            if os.path.exists(f'{message.id}downstatus.txt'):
-                try:
-                    os.remove(f'{message.id}downstatus.txt')
-                except:
-                    pass
-            
-            # Robust Cleanup: Delete the entire temp directory
-            if os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except:
-                    pass
-        
-            return await smsg.edit("❌ **Task Cancelled**")
-            
-        logger.error(f"Error downloading media: {e}")
-        
-        # Cleanup on error
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-                
-        if ERROR_MESSAGE:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
-                                      parse_mode=enums.ParseMode.HTML)
-        return await smsg.delete()
+        # ----------------------------------------
+        # Create unique temp directory for this task
+        # ----------------------------------------
+        temp_dir = f"downloads/{message.id}_{msgid}"
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
 
-    if batch_temp.IS_BATCH.get(message.from_user.id):
-        # Cleanup if cancelled during gap
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-        return
-
-    try:
-        asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
-    except Exception as e:
-        logger.error(f"Error creating upload status task: {e}")
-        
-    caption = msg.caption if msg.caption else None
-    
-    if batch_temp.IS_BATCH.get(message.from_user.id):
-         # Cleanup if cancelled during gap
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-        return
-
-    try:
-        if "Document" == msg_type:
-            try:
-                ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
-            except:
-                ph_path = None
-            
-            # Get original filename if available
-            file_name = None
-            if hasattr(msg.document, 'file_name') and msg.document.file_name:
-                # Sanitize filename to remove problematic characters
-                file_name = sanitize_filename(msg.document.file_name)
-            
-            await client.send_document(
-                chat, 
-                file_path, 
-                thumb=ph_path, 
-                caption=caption, 
-                reply_to_message_id=message.id,
-                file_name=file_name,  # Pass sanitized filename
-                parse_mode=enums.ParseMode.HTML, 
-                progress=progress,
-                progress_args=[message, "up"]
-            )
-            if ph_path and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif "Video" == msg_type:
-            try:
-                ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
-            except:
-                ph_path = None
-            
-            # Get original filename if available
-            file_name = None
-            if hasattr(msg.video, 'file_name') and msg.video.file_name:
-                file_name = sanitize_filename(msg.video.file_name)
-            
-            await client.send_video(
-                chat, 
-                file_path, 
-                duration=msg.video.duration, 
-                width=msg.video.width,
-                height=msg.video.height, 
-                thumb=ph_path, 
-                caption=caption,
-                reply_to_message_id=message.id, 
-                file_name=file_name,  # Pass sanitized filename
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress, 
-                progress_args=[message, "up"]
-            )
-            if ph_path and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif "Animation" == msg_type:
-            await client.send_animation(
-                chat, 
-                file_path, 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-
-        elif "Sticker" == msg_type:
-            await client.send_sticker(
-                chat, 
-                file_path, 
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML
-            )
-
-        elif "Voice" == msg_type:
-            await client.send_voice(
-                chat, 
-                file_path, 
-                caption=caption, 
-                caption_entities=msg.caption_entities,
-                reply_to_message_id=message.id, 
-                parse_mode=enums.ParseMode.HTML,
-                progress=progress, 
-                progress_args=[message, "up"]
-            )
-
-        elif "Audio" == msg_type:
-            try:
-                ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
-            except:
-                ph_path = None
-            
-            # Get original filename if available
-            file_name = None
-            if hasattr(msg.audio, 'file_name') and msg.audio.file_name:
-                file_name = sanitize_filename(msg.audio.file_name)
-                if not file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav')):
-                    file_name = f"{file_name}.mp3"
-            
-            await client.send_audio(
-                chat, 
-                file_path, 
-                thumb=ph_path, 
-                caption=caption, 
-                reply_to_message_id=message.id,
-                file_name=file_name,  # Pass sanitized filename
-                parse_mode=enums.ParseMode.HTML, 
-                progress=progress,
-                progress_args=[message, "up"]
-            )
-            if ph_path and os.path.exists(ph_path):
-                os.remove(ph_path)
-
-        elif "Photo" == msg_type:
-            await client.send_photo(
-                chat, 
-                file_path, 
-                caption=caption, 
-                reply_to_message_id=message.id,
-                parse_mode=enums.ParseMode.HTML
-            )
-    except Exception as e:
-        # Check if cancelled (flag is True) or exception message contains "Cancelled"
-        if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
-            if os.path.exists(f'{message.id}upstatus.txt'):
-                try:
-                    os.remove(f'{message.id}upstatus.txt')
-                except:
-                    pass
-            
-            # Robust Cleanup: Delete the entire temp directory
-            if os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except:
-                    pass
-            return await smsg.edit("❌ **Task Cancelled**")
-
-        logger.error(f"Error sending media: {e}")
-        if ERROR_MESSAGE:
-            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
-                                      parse_mode=enums.ParseMode.HTML)
-
-    if os.path.exists(f'{message.id}upstatus.txt'):
-        os.remove(f'{message.id}upstatus.txt')
-        
-    # Final cleanup of temp directory
-    if os.path.exists(temp_dir):
         try:
-            shutil.rmtree(temp_dir)
-        except:
-            pass
+            asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+        except Exception as e:
+            logger.error(f"Error creating download status task: {e}")
+            
+        file_path = None
+        download_success = False
+        
+        try:
+            # Download with a simpler file name to avoid path issues
+            timestamp = int(time.time())
+            temp_file_name = f"file_{timestamp}"
+            file_path = await acc.download_media(
+                msg, 
+                file_name=os.path.join(temp_dir, temp_file_name), 
+                progress=progress, 
+                progress_args=[message, "down"]
+            )
+            
+            # Check if file was downloaded successfully and has content
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                if file_size > 0:
+                    download_success = True
+                    logger.info(f"File downloaded successfully: {file_path}, Size: {humanbytes(file_size)}")
+                else:
+                    logger.warning(f"Downloaded file is empty (0 bytes): {file_path}")
+                    # Delete empty file
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    raise Exception("File size equals to 0 B")
+            else:
+                raise Exception("File download failed or file not found")
+            
+            if os.path.exists(f'{message.id}downstatus.txt'):
+                os.remove(f'{message.id}downstatus.txt')
+                
+        except Exception as e:
+            # Check if cancelled (flag is True) or exception message contains "Cancelled"
+            if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
+                if os.path.exists(f'{message.id}downstatus.txt'):
+                    try:
+                        os.remove(f'{message.id}downstatus.txt')
+                    except:
+                        pass
+                
+                # Robust Cleanup: Delete the entire temp directory
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+            
+                await smsg.edit("❌ **Task Cancelled**")
+                return False
+                
+            logger.error(f"Error downloading media (attempt {retry_count + 1}/{max_retries}): {e}")
+            
+            # Cleanup on error
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+                    
+            # Check if we should retry
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Download failed. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                await smsg.delete()
+                return False
 
-    await client.delete_messages(message.chat.id, [smsg.id])
+        if not download_success:
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Download incomplete. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+            # Cleanup if cancelled during gap
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            return False
+
+        try:
+            asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
+        except Exception as e:
+            logger.error(f"Error creating upload status task: {e}")
+            
+        caption = msg.caption if msg.caption else None
+        
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+             # Cleanup if cancelled during gap
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            return False
+
+        upload_success = False
+        try:
+            if "Document" == msg_type:
+                try:
+                    ph_path = await acc.download_media(msg.document.thumbs[0].file_id)
+                except:
+                    ph_path = None
+                
+                # Get original filename if available
+                file_name = None
+                if hasattr(msg.document, 'file_name') and msg.document.file_name:
+                    # Sanitize filename to remove problematic characters
+                    file_name = sanitize_filename(msg.document.file_name)
+                
+                await client.send_document(
+                    chat, 
+                    file_path, 
+                    thumb=ph_path, 
+                    caption=caption, 
+                    reply_to_message_id=message.id,
+                    file_name=file_name,  # Pass sanitized filename
+                    parse_mode=enums.ParseMode.HTML, 
+                    progress=progress,
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            elif "Video" == msg_type:
+                try:
+                    ph_path = await acc.download_media(msg.video.thumbs[0].file_id)
+                except:
+                    ph_path = None
+                
+                # Get original filename if available
+                file_name = None
+                if hasattr(msg.video, 'file_name') and msg.video.file_name:
+                    file_name = sanitize_filename(msg.video.file_name)
+                
+                await client.send_video(
+                    chat, 
+                    file_path, 
+                    duration=msg.video.duration, 
+                    width=msg.video.width,
+                    height=msg.video.height, 
+                    thumb=ph_path, 
+                    caption=caption,
+                    reply_to_message_id=message.id, 
+                    file_name=file_name,  # Pass sanitized filename
+                    parse_mode=enums.ParseMode.HTML,
+                    progress=progress, 
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            elif "Animation" == msg_type:
+                await client.send_animation(
+                    chat, 
+                    file_path, 
+                    reply_to_message_id=message.id, 
+                    parse_mode=enums.ParseMode.HTML
+                )
+                upload_success = True
+
+            elif "Sticker" == msg_type:
+                await client.send_sticker(
+                    chat, 
+                    file_path, 
+                    reply_to_message_id=message.id, 
+                    parse_mode=enums.ParseMode.HTML
+                )
+                upload_success = True
+
+            elif "Voice" == msg_type:
+                await client.send_voice(
+                    chat, 
+                    file_path, 
+                    caption=caption, 
+                    caption_entities=msg.caption_entities,
+                    reply_to_message_id=message.id, 
+                    parse_mode=enums.ParseMode.HTML,
+                    progress=progress, 
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+
+            elif "Audio" == msg_type:
+                try:
+                    ph_path = await acc.download_media(msg.audio.thumbs[0].file_id)
+                except:
+                    ph_path = None
+                
+                # Get original filename if available
+                file_name = None
+                if hasattr(msg.audio, 'file_name') and msg.audio.file_name:
+                    file_name = sanitize_filename(msg.audio.file_name)
+                    if not file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav')):
+                        file_name = f"{file_name}.mp3"
+                
+                await client.send_audio(
+                    chat, 
+                    file_path, 
+                    thumb=ph_path, 
+                    caption=caption, 
+                    reply_to_message_id=message.id,
+                    file_name=file_name,  # Pass sanitized filename
+                    parse_mode=enums.ParseMode.HTML, 
+                    progress=progress,
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            elif "Photo" == msg_type:
+                await client.send_photo(
+                    chat, 
+                    file_path, 
+                    caption=caption, 
+                    reply_to_message_id=message.id,
+                    parse_mode=enums.ParseMode.HTML
+                )
+                upload_success = True
+                
+        except Exception as e:
+            # Check if cancelled (flag is True) or exception message contains "Cancelled"
+            if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
+                if os.path.exists(f'{message.id}upstatus.txt'):
+                    try:
+                        os.remove(f'{message.id}upstatus.txt')
+                    except:
+                        pass
+                
+                # Robust Cleanup: Delete the entire temp directory
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                    pass
+                await smsg.edit("❌ **Task Cancelled**")
+                return False
+
+            logger.error(f"Error sending media (attempt {retry_count + 1}/{max_retries}): {e}")
+            
+            # Check if we should retry
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Upload failed. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                if os.path.exists(f'{message.id}upstatus.txt'):
+                    os.remove(f'{message.id}upstatus.txt')
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+                await smsg.delete()
+                return False
+
+        if os.path.exists(f'{message.id}upstatus.txt'):
+            os.remove(f'{message.id}upstatus.txt')
+            
+        # Final cleanup of temp directory
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+
+        await client.delete_messages(message.chat.id, [smsg.id])
+        
+        # Update last upload time
+        batch_temp.LAST_UPLOAD_TIME[message.from_user.id] = time.time()
+        
+        return upload_success
     
-    # Update last upload time
-    batch_temp.LAST_UPLOAD_TIME[message.from_user.id] = time.time()
+    # If we reach here, all retries failed
+    return False
 
 #-------------------
 # Get message type

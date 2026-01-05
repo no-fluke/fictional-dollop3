@@ -670,7 +670,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                     try:
                         shutil.rmtree(temp_dir)
                     except:
-                    pass
+                        pass
                 await smsg.edit("❌ **Task Cancelled**")
                 return False
 

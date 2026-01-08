@@ -338,7 +338,7 @@ async def save(client: Client, message: Message):
 # -------------------
 
 async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
-    max_retries = 3
+    max_retries = 10
     retry_count = 0
     
     while retry_count < max_retries:
